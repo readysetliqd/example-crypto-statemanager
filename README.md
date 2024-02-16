@@ -13,8 +13,8 @@ Following the instructions here and/or using any part of this project trades wit
 - (optional) Change constants as desired
     - constMaxBal is the number of coins in which the program will enter, if decimal is required, must change var maxBal as well 
     - interval is the timeframe in minutes that orders will update, check Kraken OHLC docs for enums
-    - pair must be a valid tradable websocket name for the pair
-    - buy order and sell order numbers can be any int32, must be unique
+    - pair must be a valid tradable websocket name for the pair and asset must be corresponding base asset for pair, default is XBT/USD (Bitcoin) asset XXBT
+    - buyOrder and sellOrder numbers are the user reference numbers passed to the exhcange; can be any int32, must be unique
     - constOrderDist is the percent order distance or spread for how far away from candle close orders will be placed, expressed in decimals
     - state names can be any string, must be unique
     - constOrderMin and pairDecimals are determined by the exchange, you can find these from calling krakenspot.GetTradableAssetPairsInfo()

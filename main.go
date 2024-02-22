@@ -295,7 +295,7 @@ func main() {
 	orderPrices := &OrderPrices{}
 
 	// Initialize state manager with unique strategyID
-	sm := sms.NewStateManager(strategyID)
+	sm := sms.NewStateManager(strategyID, statemanager.WithoutRun())
 
 	// constructor function for BaseBalState with common required fields for all states
 	baseState := func() BaseBalState {

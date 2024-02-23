@@ -21,3 +21,7 @@
 go.work
 
 **/*.env
+
+errors.log
+open_orders.jsonl
+trades.jsonl

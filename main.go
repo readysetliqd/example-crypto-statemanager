@@ -84,7 +84,7 @@ func (s *ZeroBalState) Enter(prevState statemanager.State) {
 	switch prevState.(type) { // determine which state type was the previous state
 	case *NormalBalState: // switching from normal balance state, don't need to cancel sells if only one order config, should just be filled
 		log.Println("PrevState was NormalBalState")
-	case nil: // only on program startup should prevState be nil, add buy order
+	case *statemanager.InitialState: // only on program startup should prevState be *statemanager.InitialState, add buy order
 		log.Println("PrevState was nil")
 		s.kc.WSAddOrder(ks.WSLimit(s.op.buyPrice.String()), "buy", orderVolume.String(), pair, ks.WSUserRef(buyOrderStr), ks.WSPostOnly())
 	default: // we should never reach this if the code is correct
@@ -102,7 +102,7 @@ func (s *NormalBalState) Enter(prevState statemanager.State) {
 	case *MaxedBalState: // coming from max balance, add the missing buy order
 		log.Println("PrevState was MaxedBalState")
 		s.kc.WSAddOrder(ks.WSLimit(s.op.buyPrice.String()), "buy", orderVolume.String(), pair, ks.WSUserRef(buyOrderStr), ks.WSPostOnly())
-	case nil: // only on program startup should prevState be nil, add both buy and sell orders
+	case *statemanager.InitialState: // only on program startup should prevState be *statemanager.InitialState, add both buy and sell orders
 		log.Println("PrevState was nil")
 		s.kc.WSAddOrder(ks.WSLimit(s.op.sellPrice.String()), "sell", orderVolume.String(), pair, ks.WSUserRef(sellOrderStr), ks.WSPostOnly())
 		s.kc.WSAddOrder(ks.WSLimit(s.op.buyPrice.String()), "buy", orderVolume.String(), pair, ks.WSUserRef(buyOrderStr), ks.WSPostOnly())
@@ -118,7 +118,7 @@ func (s *MaxedBalState) Enter(prevState statemanager.State) {
 	case *NormalBalState: // entering from normal state, cancel bids but leave the asks
 		log.Println("PrevState was NormalBalState")
 		s.kc.WSCancelOrder(buyOrderStr)
-	case nil: // entering from nil state (always only on startup) place asks
+	case *statemanager.InitialState: // entering from *statemanager.InitialState state (always only on startup) place asks
 		log.Println("PrevState was nil")
 		s.kc.WSAddOrder(ks.WSLimit(s.op.sellPrice.String()), "sell", orderVolume.String(), pair, ks.WSUserRef(sellOrderStr), ks.WSPostOnly())
 	default: // we should never reach this if the code is correct
@@ -295,7 +295,7 @@ func main() {
 	orderPrices := &OrderPrices{}
 
 	// Initialize state manager with unique strategyID
-	sm := sms.NewStateManager(strategyID, statemanager.WithoutRun())
+	sm := sms.NewStateManager(strategyID)
 
 	// constructor function for BaseBalState with common required fields for all states
 	baseState := func() BaseBalState {
@@ -489,9 +489,6 @@ func main() {
 	} else {
 		sm.SetState(maxedBalState)
 	}
-
-	// Start state manager
-	go sm.Run()
 
 	// block indefinitely
 	select {}

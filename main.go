@@ -59,6 +59,15 @@ type OrderPrices struct {
 	buyPrice  decimal.Decimal
 }
 
+type StrategyStates struct {
+	kc             *ks.KrakenClient
+	sm             *statemanager.StateManager
+	logger         *log.Logger
+	zeroBalState   *ZeroBalState
+	normalBalState *NormalBalState
+	maxedBalState  *MaxedBalState
+}
+
 type BaseBalState struct {
 	*statemanager.DefaultState
 	kc *ks.KrakenClient
@@ -308,18 +317,23 @@ func main() {
 
 	// Initialize states and Add their names to state manager (necessary for
 	// GetState method calls in custom HandleEvent methods)
-	zeroBalState := &ZeroBalState{
-		BaseBalState: baseState(),
+	ss := &StrategyStates{
+		kc:     kc,
+		sm:     sm,
+		logger: logger,
+		zeroBalState: &ZeroBalState{
+			BaseBalState: baseState(),
+		},
+		normalBalState: &NormalBalState{
+			BaseBalState: baseState(),
+		},
+		maxedBalState: &MaxedBalState{
+			BaseBalState: baseState(),
+		},
 	}
-	normalBalState := &NormalBalState{
-		BaseBalState: baseState(),
-	}
-	maxedBalState := &MaxedBalState{
-		BaseBalState: baseState(),
-	}
-	sm.AddState(zeroBalStateName, zeroBalState)
-	sm.AddState(normalBalStateName, normalBalState)
-	sm.AddState(maxedBalStateName, maxedBalState)
+	sm.AddState(zeroBalStateName, ss.zeroBalState)
+	sm.AddState(normalBalStateName, ss.normalBalState)
+	sm.AddState(maxedBalStateName, ss.maxedBalState)
 
 	// log a message confirming system is online, otherwise attempt cleanup and
 	// shut down. System status callbacks will be called any time system status
@@ -478,20 +492,53 @@ func main() {
 
 	// Determine initial state from current baseAsset balance and enter it
 	time.Sleep(time.Millisecond * 1000) // hardcoded wait for first OHLC message received and processed
-	bal, err := kc.AssetBalance(baseAsset)
-	if err != nil {
-		logger.Fatal("error getting initial asset balance |", err)
-	}
-	if bal.Cmp(orderVolume) == -1 {
-		sm.SetState(zeroBalState)
-	} else if bal.Cmp(maxBal) == -1 {
-		sm.SetState(normalBalState)
-	} else {
-		sm.SetState(maxedBalState)
-	}
+	ss.GetBalanceAndSetInitialState()
+
+	// Check for disconnect every 100 seconds and replace orders
+	go func() {
+		ticker := time.NewTicker(time.Millisecond * 100)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			if kc.Disconnected() {
+				sm.Reset()
+				kc.WaitForReconnect()
+				kc.WaitForSubscriptions()
+				sm.Run()
+				//wait for open orders manager to build new orders
+				time.Sleep(time.Millisecond * 300)
+				// Find and cancel any remaining open orders from before disconnect
+				orders := kc.MapOpenOrders()
+				var cancelOrdersQueue []string
+				for id, order := range orders {
+					// if order userref is in fillmap (order is from this program)
+					if _, ok := fillMap[int32(order.UserRef)]; ok {
+						// add to slice to be cancelled
+						cancelOrdersQueue = append(cancelOrdersQueue, id)
+					}
+				}
+				kc.WSCancelOrders(cancelOrdersQueue)
+				ss.GetBalanceAndSetInitialState()
+			}
+		}
+	}()
 
 	// block indefinitely
 	select {}
+}
+
+func (ss *StrategyStates) GetBalanceAndSetInitialState() {
+	bal, err := ss.kc.AssetBalance(baseAsset)
+	if err != nil {
+		ss.logger.Fatal("error getting initial asset balance |", err)
+	}
+	if bal.Cmp(orderVolume) == -1 {
+		ss.sm.SetState(ss.zeroBalState)
+	} else if bal.Cmp(maxBal) == -1 {
+		ss.sm.SetState(ss.normalBalState)
+	} else {
+		ss.sm.SetState(ss.maxedBalState)
+	}
 }
 
 func replaceOrEdit(kc *ks.KrakenClient, userRef int32, price string) {

@@ -304,7 +304,9 @@ func main() {
 	orderPrices := &OrderPrices{}
 
 	// Initialize state manager with unique strategyID
-	sm := sms.NewStateManager(strategyID)
+	// we pass statemanager.WithRunTypeNoUpdate() to use less compute since we
+	// didn't write a custom Update method for any state
+	sm := sms.NewStateManager(strategyID, statemanager.WithRunTypeNoUpdate())
 
 	// constructor function for BaseBalState with common required fields for all states
 	baseState := func() BaseBalState {
@@ -496,31 +498,25 @@ func main() {
 
 	// Check for disconnect every 100 seconds and replace orders
 	go func() {
-		ticker := time.NewTicker(time.Millisecond * 100)
-		defer ticker.Stop()
-
-		for range ticker.C {
-			if kc.Disconnected() {
-				sm.Reset()
-				kc.WaitForReconnect()
-				kc.WaitForSubscriptions()
-				sm.Run()
-				//wait for open orders manager to build new orders
-				time.Sleep(time.Millisecond * 300)
-				// Find and cancel any remaining open orders from before disconnect
-				orders := kc.MapOpenOrders()
-				var cancelOrdersQueue []string
-				for id, order := range orders {
-					// if order userref is in fillmap (order is from this program)
-					if _, ok := fillMap[int32(order.UserRef)]; ok {
-						// add to slice to be cancelled
-						cancelOrdersQueue = append(cancelOrdersQueue, id)
-					}
-				}
-				kc.WSCancelOrders(cancelOrdersQueue)
-				ss.GetBalanceAndSetInitialState()
+		kc.WaitForDisconnect()
+		sm.Reset()
+		kc.WaitForReconnect()
+		kc.WaitForSubscriptions()
+		sm.Run()
+		//wait for open orders manager to build new orders
+		time.Sleep(time.Millisecond * 300)
+		// Find and cancel any remaining open orders from before disconnect
+		orders := kc.MapOpenOrders()
+		var cancelOrdersQueue []string
+		for id, order := range orders {
+			// if order userref is in fillmap (order is from this program)
+			if _, ok := fillMap[int32(order.UserRef)]; ok {
+				// add to slice to be cancelled
+				cancelOrdersQueue = append(cancelOrdersQueue, id)
 			}
 		}
+		kc.WSCancelOrders(cancelOrdersQueue)
+		ss.GetBalanceAndSetInitialState()
 	}()
 
 	// block indefinitely

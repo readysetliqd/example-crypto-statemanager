@@ -2,8 +2,8 @@ github.com/gorilla/websocket v1.5.1 h1:gmztn0JnHVt9JZquRuzLw3g4wouNVzKL15iLr/zn/
 github.com/gorilla/websocket v1.5.1/go.mod h1:x3kM2JMyaluk02fnUJpQuwD2dCS5NDG2ZHL0uE0tcaY=
 github.com/joho/godotenv v1.5.1 h1:7eLL/+HRGLY0ldzfGMeQkb7vMd0as4CfYvUVzLqw0N0=
 github.com/joho/godotenv v1.5.1/go.mod h1:f4LDr5Voq0i2e/R5DDNOoa2zzDfwtkZa6DnEwAbqwq4=
-github.com/readysetliqd/crypto-exchange-library-go v0.0.0-20240229104110-22f48851ba6f h1:SzfQCRSIgbfV3Bz1bH0l+oRSQ48bQF+82f2UvMJhhWU=
-github.com/readysetliqd/crypto-exchange-library-go v0.0.0-20240229104110-22f48851ba6f/go.mod h1:y+rAGzCzIQhB6ZujHcGkIcHeE9LKnR5kA98sojxPSCU=
+github.com/readysetliqd/crypto-exchange-library-go v0.0.0-20240301092219-7793063f76cf h1:SEuOn0SEyBsFuhHDgoG5xRXa/yNctKwEENd2Dozam+I=
+github.com/readysetliqd/crypto-exchange-library-go v0.0.0-20240301092219-7793063f76cf/go.mod h1:y+rAGzCzIQhB6ZujHcGkIcHeE9LKnR5kA98sojxPSCU=
 github.com/shopspring/decimal v1.3.1 h1:2Usl1nmF/WZucqkFZhnfFYxxxu8LG21F6nPQBE5gKV8=
 github.com/shopspring/decimal v1.3.1/go.mod h1:DKyhrW/HYNuLGql+MJL6WCR6knT2jwCFRcu2hWCYk4o=
 golang.org/x/net v0.17.0 h1:pVaXccu2ozPjCXewfr1S7xza/zcXTity9cCdXQYSjIM=

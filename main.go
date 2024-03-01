@@ -502,7 +502,7 @@ func main() {
 		sm.Reset()
 		kc.WaitForReconnect()
 		kc.WaitForSubscriptions()
-		sm.Run()
+		sm.Restart()
 		//wait for open orders manager to build new orders
 		time.Sleep(time.Millisecond * 300)
 		// Find and cancel any remaining open orders from before disconnect

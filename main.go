@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -20,6 +21,7 @@ const (
 	interval           = uint16(15) // minutes
 	baseAsset          = "XXBT"
 	pair               = "XBT/USD"
+	pairREST           = "XXBTZUSD"
 	constOrderMin      = 0.0001
 	pairDecimals       = 1
 	strategyID         = 100
@@ -54,35 +56,36 @@ var fillMap = map[int32]*orderFill{
 	buyOrder:  &orderFill{userRefStr: buyOrderStr, filled: false, direction: "buy", partiallyFilled: false, partiallyFilledAmt: decimal.Zero},
 }
 
-type OrderPrices struct {
-	sellPrice decimal.Decimal
-	buyPrice  decimal.Decimal
-}
-
+// Struct to hold pointers so we can refactor startup logic
 type StrategyStates struct {
 	kc             *ks.KrakenClient
 	sm             *statemanager.StateManager
+	nc             *newCandleEvent
 	logger         *log.Logger
 	zeroBalState   *ZeroBalState
 	normalBalState *NormalBalState
 	maxedBalState  *MaxedBalState
 }
 
+// BaseBalState holds common fields we'll embed to use in all States
 type BaseBalState struct {
 	*statemanager.DefaultState
 	kc *ks.KrakenClient
 	sm *statemanager.StateManager
-	op *OrderPrices
+	nc *newCandleEvent
 }
 
+// ZeroBalState when we have zero coins, don't place asks
 type ZeroBalState struct {
 	BaseBalState
 }
 
+// NormalBalState anywhere between zero balance and maxed balance, place bids and asks
 type NormalBalState struct {
 	BaseBalState
 }
 
+// MaxedBalState when coin balance exceeds preset constMaxBal, stop placing bids
 type MaxedBalState struct {
 	BaseBalState
 }
@@ -94,8 +97,8 @@ func (s *ZeroBalState) Enter(prevState statemanager.State) {
 	case *NormalBalState: // switching from normal balance state, don't need to cancel sells if only one order config, should just be filled
 		log.Println("PrevState was NormalBalState")
 	case *statemanager.InitialState: // only on program startup should prevState be *statemanager.InitialState, add buy order
-		log.Println("PrevState was nil")
-		s.kc.WSAddOrder(ks.WSLimit(s.op.buyPrice.String()), "buy", orderVolume.String(), pair, ks.WSUserRef(buyOrderStr), ks.WSPostOnly())
+		log.Println("PrevState was *InitialState")
+		s.kc.WSAddOrder(ks.WSLimit(s.nc.buyPrice.String()), "buy", orderVolume.String(), pair, ks.WSUserRef(buyOrderStr), ks.WSPostOnly())
 	default: // we should never reach this if the code is correct
 		log.Fatalf("entering from undefined prevState type: %v\n", prevState)
 	}
@@ -107,14 +110,14 @@ func (s *NormalBalState) Enter(prevState statemanager.State) {
 	switch prevState.(type) { // determine which state type was the previous state
 	case *ZeroBalState: // coming from zero balance, add the missing sell order
 		log.Println("PrevState was ZeroBalState")
-		s.kc.WSAddOrder(ks.WSLimit(s.op.sellPrice.String()), "sell", orderVolume.String(), pair, ks.WSUserRef(sellOrderStr), ks.WSPostOnly())
+		s.kc.WSAddOrder(ks.WSLimit(s.nc.sellPrice.String()), "sell", orderVolume.String(), pair, ks.WSUserRef(sellOrderStr), ks.WSPostOnly())
 	case *MaxedBalState: // coming from max balance, add the missing buy order
 		log.Println("PrevState was MaxedBalState")
-		s.kc.WSAddOrder(ks.WSLimit(s.op.buyPrice.String()), "buy", orderVolume.String(), pair, ks.WSUserRef(buyOrderStr), ks.WSPostOnly())
+		s.kc.WSAddOrder(ks.WSLimit(s.nc.buyPrice.String()), "buy", orderVolume.String(), pair, ks.WSUserRef(buyOrderStr), ks.WSPostOnly())
 	case *statemanager.InitialState: // only on program startup should prevState be *statemanager.InitialState, add both buy and sell orders
-		log.Println("PrevState was nil")
-		s.kc.WSAddOrder(ks.WSLimit(s.op.sellPrice.String()), "sell", orderVolume.String(), pair, ks.WSUserRef(sellOrderStr), ks.WSPostOnly())
-		s.kc.WSAddOrder(ks.WSLimit(s.op.buyPrice.String()), "buy", orderVolume.String(), pair, ks.WSUserRef(buyOrderStr), ks.WSPostOnly())
+		log.Println("PrevState was *InitialState")
+		s.kc.WSAddOrder(ks.WSLimit(s.nc.sellPrice.String()), "sell", orderVolume.String(), pair, ks.WSUserRef(sellOrderStr), ks.WSPostOnly())
+		s.kc.WSAddOrder(ks.WSLimit(s.nc.buyPrice.String()), "buy", orderVolume.String(), pair, ks.WSUserRef(buyOrderStr), ks.WSPostOnly())
 	default: // we should never reach this if the code is correct
 		log.Fatalf("entering from undefined prevState type: %v\n", prevState)
 	}
@@ -128,8 +131,8 @@ func (s *MaxedBalState) Enter(prevState statemanager.State) {
 		log.Println("PrevState was NormalBalState")
 		s.kc.WSCancelOrder(buyOrderStr)
 	case *statemanager.InitialState: // entering from *statemanager.InitialState state (always only on startup) place asks
-		log.Println("PrevState was nil")
-		s.kc.WSAddOrder(ks.WSLimit(s.op.sellPrice.String()), "sell", orderVolume.String(), pair, ks.WSUserRef(sellOrderStr), ks.WSPostOnly())
+		log.Println("PrevState was *InitialState")
+		s.kc.WSAddOrder(ks.WSLimit(s.nc.sellPrice.String()), "sell", orderVolume.String(), pair, ks.WSUserRef(sellOrderStr), ks.WSPostOnly())
 	default: // we should never reach this if the code is correct
 		log.Fatalf("entering from undefined prevState type: %v\n", prevState)
 	}
@@ -138,7 +141,8 @@ func (s *MaxedBalState) Enter(prevState statemanager.State) {
 // Custom HandleEvent() function overwrites (statemanager.DefaultState) HandleEvent()
 func (s *ZeroBalState) HandleEvent(ctx context.Context, event statemanager.Event, responseChan chan interface{}) error {
 	switch e := event.(type) { // determine what type of event is coming through the event channel
-	case *newCandle: // new 15 minute candle close, replace or move the bid
+	case *newCandleEvent: // new 15 minute candle close, replace or move the bid
+		e.Process(ctx)
 		replaceOrEdit(s.kc, buyOrder, e.buyPrice.String())
 	case *newTrade: // new trade confirmation, check balance and change state if necessary
 		// get balance from internal balance manager
@@ -162,7 +166,8 @@ func (s *ZeroBalState) HandleEvent(ctx context.Context, event statemanager.Event
 // Custom HandleEvent() function overwrites (statemanager.DefaultState) HandleEvent()
 func (s *NormalBalState) HandleEvent(ctx context.Context, event statemanager.Event, responseChan chan interface{}) error {
 	switch e := event.(type) { // determine what type of event is coming through the event channel
-	case *newCandle: // new 15 minute candle close, replace or move the bid
+	case *newCandleEvent: // new 15 minute candle close, replace or move the bid
+		e.Process(ctx)
 		replaceOrEdit(s.kc, sellOrder, e.sellPrice.String())
 		replaceOrEdit(s.kc, buyOrder, e.buyPrice.String())
 	case *newTrade: // new trade confirmation, check balance and change state if necessary
@@ -195,7 +200,8 @@ func (s *NormalBalState) HandleEvent(ctx context.Context, event statemanager.Eve
 // Custom HandleEvent() function overwrites (statemanager.DefaultState) HandleEvent()
 func (s *MaxedBalState) HandleEvent(ctx context.Context, event statemanager.Event, responseChan chan interface{}) error {
 	switch e := event.(type) { // determine what type of event is coming through the event channel
-	case *newCandle: // new 15 minute candle close, replace or move the bid
+	case *newCandleEvent: // new 15 minute candle close, replace or move the bid
+		e.Process(ctx)
 		replaceOrEdit(s.kc, sellOrder, e.sellPrice.String())
 	case *newTrade: // new trade confirmation, check balance and change state if necessary
 		// get balance from internal balance manager
@@ -216,19 +222,25 @@ func (s *MaxedBalState) HandleEvent(ctx context.Context, event statemanager.Even
 	return nil
 }
 
-// custom event type
-type newCandle struct {
+// New custom event type to signal a 15minute candle is closed.
+type newCandleEvent struct {
 	*statemanager.DefaultEvent // embed DefaultEvent
 	closeStr                   string
 	close                      decimal.Decimal
 	sellPrice                  decimal.Decimal
 	buyPrice                   decimal.Decimal
+	mu                         sync.RWMutex
 }
 
 // Custom Process() method to overwrite embedded DefaultEvent.Process()
-func (c *newCandle) Process(ctx context.Context) error {
+// Converts the closeStr price to decimal.Decimal and calculates sell orders'
+// and buy orders' price levels based on preset constOrderDist
+func (c *newCandleEvent) Process(ctx context.Context) error {
 	// convert incoming close price (string type from Kraken's WebSocket server) to decimal
-	close, err := decimal.NewFromString(c.closeStr)
+	c.mu.RLock()
+	closeStr := c.closeStr
+	c.mu.RUnlock()
+	close, err := decimal.NewFromString(closeStr)
 	if err != nil {
 		return err
 	}
@@ -241,7 +253,7 @@ func (c *newCandle) Process(ctx context.Context) error {
 }
 
 // New custom event type, just need to embed DefaultEvent to match interface,
-// but no need to change/overwrite methods as we only use it's type to signal
+// but no need to change/overwrite methods as we only use it's type as a signal
 type newTrade struct {
 	*statemanager.DefaultEvent
 }
@@ -300,8 +312,7 @@ func main() {
 		}
 	}()
 
-	//initialize orderPrices
-	orderPrices := &OrderPrices{}
+	newCandle := &newCandleEvent{}
 
 	// Initialize state manager with unique strategyID
 	// we pass statemanager.WithRunTypeNoUpdate() to use less compute since we
@@ -313,7 +324,7 @@ func main() {
 		return BaseBalState{
 			kc: kc,
 			sm: sm,
-			op: orderPrices,
+			nc: newCandle,
 		}
 	}
 
@@ -322,6 +333,7 @@ func main() {
 	ss := &StrategyStates{
 		kc:     kc,
 		sm:     sm,
+		nc:     newCandle,
 		logger: logger,
 		zeroBalState: &ZeroBalState{
 			BaseBalState: baseState(),
@@ -396,47 +408,18 @@ func main() {
 
 	//// Callbacks for channels and handling events
 	// "ohlc" WebSocket channel
-	firstMessageReceived := false
-	var lastTimeStamp string
 	ohlcCallback := func(data interface{}) {
 		msg, ok := data.(ks.WSOHLCResp)
 		if !ok {
 			logger.Println("unknown data type sent to ohlcCallback; shutting down")
 			sigs <- os.Interrupt
 		}
-		log.Println(msg)
-		// create a newCandle event with close
-		newClose := &newCandle{
-			closeStr: msg.OHLC.Close,
-		}
+		// log.Println(msg)
 
-		// Call custom process method to convert close price to decimal.Decimal
-		// and calculate order prices
-		err = newClose.Process(context.TODO())
-		if err != nil {
-			logger.Println("error processing newClose event; shutting down")
-			sigs <- os.Interrupt
-		}
-
-		// Copy order prices from event to orderPrices struct which all states
-		// have access to
-		orderPrices.CopyPrices(newClose)
-
-		// Don't signal newCandle event on first message as we don't want to
-		// the statemanager to attempt to update orders before setting the initial
-		// state at the bottom of this program
-		// Check if ohlc end time is different than the last ohlc timestamp signalling
-		// a new candle and send event. Hacky way to go about it since the server
-		// doesn't send a message exactly on the interval change, a better
-		// implementation would be to use custom state.Update() methods to
-		// check the time instead.
-		if firstMessageReceived && lastTimeStamp != msg.OHLC.EndTime {
-			sm.SendEvent(newClose)
-			lastTimeStamp = msg.OHLC.EndTime
-		} else {
-			lastTimeStamp = msg.OHLC.EndTime
-			firstMessageReceived = true
-		}
+		// keep last trade "close" price up to date for when newCandle event gets sent
+		newCandle.mu.Lock()
+		newCandle.closeStr = msg.OHLC.Close
+		newCandle.mu.Unlock()
 	}
 
 	// "ownTrades" WebSocket channel receives a message every time a new trade
@@ -496,28 +479,55 @@ func main() {
 	time.Sleep(time.Millisecond * 1000) // hardcoded wait for first OHLC message received and processed
 	ss.GetBalanceAndSetInitialState()
 
-	// Check for disconnect every 100 seconds and replace orders
+	// Disconnect recovery logic
 	go func() {
-		kc.WaitForDisconnect()
-		sm.Reset()
-		kc.WaitForReconnect()
-		kc.WaitForSubscriptions()
-		sm.Restart()
-		//wait for open orders manager to build new orders
-		time.Sleep(time.Millisecond * 300)
-		// Find and cancel any remaining open orders from before disconnect
-		orders := kc.MapOpenOrders()
-		var cancelOrdersQueue []string
-		for id, order := range orders {
-			// if order userref is in fillmap (order is from this program)
-			if _, ok := fillMap[int32(order.UserRef)]; ok {
-				// add to slice to be cancelled
-				cancelOrdersQueue = append(cancelOrdersQueue, id)
+		for {
+			// Blocks loop waiting for disconnect
+			kc.WaitForDisconnect()
+			// Resets states in state manager back to InitialState
+			sm.Reset()
+			// Blocks waiting for reconnect loop to confirm reconnection
+			kc.WaitForReconnect()
+			// Blocks waiting for websocket to send subscribe confirm messages
+			// for necessary subscriptions
+			err = kc.WaitForSubscriptions()
+			if err != nil {
+				logger.Fatal("waiting for subscriptions timed out")
 			}
+			// Runs the state manager again with last used run configuration
+			// (in our case it is "RunWithoutUpdate")
+			sm.Restart()
+			// Hardcoded wait for open orders manager to build new orders
+			time.Sleep(time.Millisecond * 300)
+			// Find and cancel any remaining stale open orders from before disconnect
+			orders := kc.MapOpenOrders()
+			var cancelOrdersQueue []string
+			for id, order := range orders {
+				// if order userref is in fillmap (order is from this program)
+				if _, ok := fillMap[int32(order.UserRef)]; ok {
+					// add to slice to be cancelled
+					cancelOrdersQueue = append(cancelOrdersQueue, id)
+				}
+			}
+			// Cancel orders
+			kc.WSCancelOrders(cancelOrdersQueue)
+			// Run startup logic again which results in orders being placed
+			ss.GetBalanceAndSetInitialState()
 		}
-		kc.WSCancelOrders(cancelOrdersQueue)
-		ss.GetBalanceAndSetInitialState()
 	}()
+
+	// Calculate time until nearest 15minute candle close and start a 15minute
+	// ticker once it hits and a go routine that sends a "newCandle" event every
+	// ticker countdown
+	time.AfterFunc(time.Until(time.Now().Truncate(time.Minute*time.Duration(interval)).Add(time.Minute*time.Duration(interval))), func() {
+		ticker := time.NewTicker(time.Minute * time.Duration(interval))
+		go func() {
+			for range ticker.C {
+				// Send "newCandle" event every 15minutes
+				sm.SendEvent(newCandle)
+			}
+		}()
+	})
 
 	// block indefinitely
 	select {}
@@ -528,6 +538,17 @@ func (ss *StrategyStates) GetBalanceAndSetInitialState() {
 	if err != nil {
 		ss.logger.Fatal("error getting initial asset balance |", err)
 	}
+	// get last close for pair
+	ohlcData, err := ss.kc.GetOHLC(pairREST, interval)
+	if err != nil {
+		ss.logger.Fatal("error getting last close price |", err)
+	}
+	// get last closed candle
+	ss.nc.mu.Lock()
+	ss.nc.closeStr = ohlcData.Data[len(ohlcData.Data)-1].Close
+	ss.nc.mu.Unlock()
+	// Process candle event to calculate initial order prices
+	ss.nc.Process(context.TODO())
 	if bal.Cmp(orderVolume) == -1 {
 		ss.sm.SetState(ss.zeroBalState)
 	} else if bal.Cmp(maxBal) == -1 {
@@ -555,11 +576,6 @@ func replaceOrEdit(kc *ks.KrakenClient, userRef int32, price string) {
 		fillMap[userRef].partiallyFilled = false
 		fillMap[userRef].partiallyFilledAmt = decimal.Zero
 	}
-}
-
-func (orderPrices *OrderPrices) CopyPrices(newClose *newCandle) {
-	orderPrices.sellPrice = newClose.sellPrice
-	orderPrices.buyPrice = newClose.buyPrice
 }
 
 func cleanup(kc *ks.KrakenClient, logger *log.Logger, file *os.File) {

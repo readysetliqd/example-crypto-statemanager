@@ -4,7 +4,7 @@ go 1.21.3
 
 require (
 	github.com/joho/godotenv v1.5.1
-	github.com/readysetliqd/crypto-exchange-library-go v0.0.0-20240301092219-7793063f76cf
+	github.com/readysetliqd/crypto-exchange-library-go v0.0.0-20240302103412-ace097523840
 	github.com/shopspring/decimal v1.3.1
 )
 

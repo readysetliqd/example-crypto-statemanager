@@ -386,20 +386,24 @@ func main() {
 			if msg.Status == "error" {
 				if strings.Contains(msg.ErrorMessage, "Invalid arguments") { // code is likely incorrect
 					logger.Println("error editing order with invalid arguments; shutting down | ", msg.ErrorMessage)
+					logger.Println(msg)
 					sigs <- os.Interrupt
 				} else {
 					logger.Println("some other error editing order; shutting down | ", msg.ErrorMessage)
+					logger.Println(msg)
 					sigs <- os.Interrupt
 				}
 			}
 		case ks.WSCancelOrderResp:
 			if msg.Status == "error" {
 				logger.Println("error canceling order; shutting down | ", msg.ErrorMessage)
+				logger.Println(msg)
 				sigs <- os.Interrupt
 			}
 		case ks.WSAddOrderResp:
 			if msg.Status == "error" {
 				logger.Println("error adding order; shutting down | ", msg.ErrorMessage)
+				logger.Println(msg)
 				sigs <- os.Interrupt
 			}
 		}

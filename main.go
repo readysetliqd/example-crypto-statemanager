@@ -43,17 +43,25 @@ var buyOrderDist = decimal.NewFromFloat(1 - constOrderDist)
 var sellOrderStr = fmt.Sprintf("%v", sellOrder)
 var buyOrderStr = fmt.Sprintf("%v", buyOrder)
 
-type orderFill struct {
-	userRefStr         string
-	direction          string
+type orderInfo struct {
+	userRefStr string
+	direction  string
+}
+
+type fillInfo struct {
 	filled             bool
 	partiallyFilled    bool
 	partiallyFilledAmt decimal.Decimal
 }
 
-var fillMap = map[int32]*orderFill{
-	sellOrder: &orderFill{userRefStr: sellOrderStr, filled: false, direction: "sell", partiallyFilled: false, partiallyFilledAmt: decimal.Zero},
-	buyOrder:  &orderFill{userRefStr: buyOrderStr, filled: false, direction: "buy", partiallyFilled: false, partiallyFilledAmt: decimal.Zero},
+var userRefMap = map[int32]*orderInfo{
+	sellOrder: &orderInfo{userRefStr: sellOrderStr, direction: "sell"},
+	buyOrder:  &orderInfo{userRefStr: buyOrderStr, direction: "buy"},
+}
+
+type fillMap struct {
+	m  map[int32]*fillInfo
+	mu sync.Mutex
 }
 
 // Struct to hold pointers so we can refactor startup logic
@@ -73,6 +81,7 @@ type BaseBalState struct {
 	kc *ks.KrakenClient
 	sm *statemanager.StateManager
 	nc *newCandleEvent
+	fm *fillMap
 }
 
 // ZeroBalState when we have zero coins, don't place asks
@@ -143,7 +152,7 @@ func (s *ZeroBalState) HandleEvent(ctx context.Context, event statemanager.Event
 	switch e := event.(type) { // determine what type of event is coming through the event channel
 	case *newCandleEvent: // new 15 minute candle close, replace or move the bid
 		e.Process(ctx)
-		replaceOrEdit(s.kc, buyOrder, e.buyPrice.String())
+		replaceOrEdit(s.kc, s.fm, buyOrder, e.buyPrice.String())
 	case *newTrade: // new trade confirmation, check balance and change state if necessary
 		// get balance from internal balance manager
 		bal, err := s.kc.AssetBalance(baseAsset)
@@ -168,8 +177,8 @@ func (s *NormalBalState) HandleEvent(ctx context.Context, event statemanager.Eve
 	switch e := event.(type) { // determine what type of event is coming through the event channel
 	case *newCandleEvent: // new 15 minute candle close, replace or move the bid
 		e.Process(ctx)
-		replaceOrEdit(s.kc, sellOrder, e.sellPrice.String())
-		replaceOrEdit(s.kc, buyOrder, e.buyPrice.String())
+		replaceOrEdit(s.kc, s.fm, sellOrder, e.sellPrice.String())
+		replaceOrEdit(s.kc, s.fm, buyOrder, e.buyPrice.String())
 	case *newTrade: // new trade confirmation, check balance and change state if necessary
 		// get balance from internal balance manager
 		bal, err := s.kc.AssetBalance(baseAsset)
@@ -202,7 +211,7 @@ func (s *MaxedBalState) HandleEvent(ctx context.Context, event statemanager.Even
 	switch e := event.(type) { // determine what type of event is coming through the event channel
 	case *newCandleEvent: // new 15 minute candle close, replace or move the bid
 		e.Process(ctx)
-		replaceOrEdit(s.kc, sellOrder, e.sellPrice.String())
+		replaceOrEdit(s.kc, s.fm, sellOrder, e.sellPrice.String())
 	case *newTrade: // new trade confirmation, check balance and change state if necessary
 		// get balance from internal balance manager
 		bal, err := s.kc.AssetBalance(baseAsset)
@@ -312,9 +321,15 @@ func main() {
 		}
 	}()
 
+	// Instantiate new candle event
 	newCandle := &newCandleEvent{}
 
-	// Initialize state manager with unique strategyID
+	// Instantiate fill map
+	fillMap := &fillMap{
+		m: make(map[int32]*fillInfo),
+	}
+
+	// Instantiate state manager with unique strategyID
 	// we pass statemanager.WithRunTypeNoUpdate() to use less compute since we
 	// didn't write a custom Update method for any state
 	sm := sms.NewStateManager(strategyID, statemanager.WithRunTypeNoUpdate())
@@ -325,6 +340,7 @@ func main() {
 			kc: kc,
 			sm: sm,
 			nc: newCandle,
+			fm: fillMap,
 		}
 	}
 
@@ -435,23 +451,25 @@ func main() {
 		}
 		for _, trades := range msg.OwnTrades {
 			for _, trade := range trades {
-				if fill, ok := fillMap[trade.UserRef]; ok { // ignores orders that aren't in this program
+				if _, ok := userRefMap[trade.UserRef]; ok { // ignores orders that aren't in this program
 					vol, err := decimal.NewFromString(trade.Volume)
 					if err != nil {
 						logger.Printf("error converting volume string to decimal; shutting down | volume: %s\n", trade.Volume)
 						sigs <- os.Interrupt
 					} else {
 						if vol.Cmp(orderVolume) == -1 { // partial order fill
-							fill.partiallyFilledAmt.Add(vol)
-							if fill.partiallyFilledAmt.Cmp(orderVolume) == -1 {
-								fill.partiallyFilled = true
+							fillMap.mu.Lock()
+							fillMap.m[trade.UserRef].partiallyFilledAmt.Add(vol)
+							if fillMap.m[trade.UserRef].partiallyFilledAmt.Cmp(orderVolume) == -1 {
+								fillMap.m[trade.UserRef].partiallyFilled = true
 							} else { // partial fill closed order, reset partial fill fields
-								fill.partiallyFilled = false
-								fill.partiallyFilledAmt = decimal.Zero
-								fill.filled = true
+								fillMap.m[trade.UserRef].partiallyFilled = false
+								fillMap.m[trade.UserRef].partiallyFilledAmt = decimal.Zero
+								fillMap.m[trade.UserRef].filled = true
 							}
+							fillMap.mu.Unlock()
 						} else { // order filled in one trade
-							fill.filled = true
+							fillMap.m[trade.UserRef].filled = true
 						}
 					}
 				}
@@ -508,7 +526,7 @@ func main() {
 			var cancelOrdersQueue []string
 			for id, order := range orders {
 				// if order userref is in fillmap (order is from this program)
-				if _, ok := fillMap[int32(order.UserRef)]; ok {
+				if _, ok := userRefMap[int32(order.UserRef)]; ok {
 					// add to slice to be cancelled
 					cancelOrdersQueue = append(cancelOrdersQueue, id)
 				}
@@ -562,23 +580,26 @@ func (ss *StrategyStates) GetBalanceAndSetInitialState() {
 	}
 }
 
-func replaceOrEdit(kc *ks.KrakenClient, userRef int32, price string) {
-	if fillMap[userRef].filled {
-		kc.WSAddOrder(ks.WSLimit(price), fillMap[userRef].direction, orderVolume.String(), pair, ks.WSUserRef(fillMap[userRef].userRefStr), ks.WSPostOnly())
-		fillMap[userRef].filled = false
-		fillMap[userRef].partiallyFilled = false
-		fillMap[userRef].partiallyFilledAmt = decimal.Zero
-	} else if fillMap[userRef].partiallyFilled {
-		kc.WSCancelOrder(fillMap[userRef].userRefStr)
-		kc.WSAddOrder(ks.WSLimit(price), fillMap[userRef].direction, orderVolume.String(), pair, ks.WSUserRef(fillMap[userRef].userRefStr), ks.WSPostOnly())
-		fillMap[userRef].filled = false
-		fillMap[userRef].partiallyFilled = false
-		fillMap[userRef].partiallyFilledAmt = decimal.Zero
+func replaceOrEdit(kc *ks.KrakenClient, fm *fillMap, userRef int32, price string) {
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+
+	if fm.m[userRef].filled {
+		kc.WSAddOrder(ks.WSLimit(price), userRefMap[userRef].direction, orderVolume.String(), pair, ks.WSUserRef(userRefMap[userRef].userRefStr), ks.WSPostOnly())
+		fm.m[userRef].filled = false
+		fm.m[userRef].partiallyFilled = false
+		fm.m[userRef].partiallyFilledAmt = decimal.Zero
+	} else if fm.m[userRef].partiallyFilled {
+		kc.WSCancelOrder(userRefMap[userRef].userRefStr)
+		kc.WSAddOrder(ks.WSLimit(price), userRefMap[userRef].direction, orderVolume.String(), pair, ks.WSUserRef(userRefMap[userRef].userRefStr), ks.WSPostOnly())
+		fm.m[userRef].filled = false
+		fm.m[userRef].partiallyFilled = false
+		fm.m[userRef].partiallyFilledAmt = decimal.Zero
 	} else {
-		kc.WSEditOrder(fillMap[userRef].userRefStr, pair, ks.WSNewPrice(price), ks.WSNewPostOnly(), ks.WSNewUserRef(fillMap[userRef].userRefStr))
-		fillMap[userRef].filled = false
-		fillMap[userRef].partiallyFilled = false
-		fillMap[userRef].partiallyFilledAmt = decimal.Zero
+		kc.WSEditOrder(userRefMap[userRef].userRefStr, pair, ks.WSNewPrice(price), ks.WSNewPostOnly(), ks.WSNewUserRef(userRefMap[userRef].userRefStr))
+		fm.m[userRef].filled = false
+		fm.m[userRef].partiallyFilled = false
+		fm.m[userRef].partiallyFilledAmt = decimal.Zero
 	}
 }
 
